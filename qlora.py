@@ -17,6 +17,8 @@ import pandas as pd
 import importlib
 from packaging import version
 from packaging.version import parse
+import shutil
+import glob
 
 import torch
 import transformers
@@ -212,6 +214,8 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+    stopping_patience: int = field(default=0, metadata={"help": 'How many evaluations where the eval score does not improve to wait before finishing training. 0 means full training with no early stopping.'})
+    load_best_model_at_end: bool = field(default=True, metadata={"help": 'Loads the highest performing model at the end of training'})
 
 @dataclass
 class GenerationArguments:
@@ -534,7 +538,7 @@ def extract_alpaca_dataset(example):
         prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
     return {'input': prompt_format.format(**example)}
 
-def local_dataset(dataset_name):
+def local_dataset(dataset_name, test_size):
     if dataset_name.endswith('.json') or dataset_name.endswith('.jsonl'):
         full_dataset = Dataset.from_json(path_or_paths=dataset_name)
     elif dataset_name.endswith('.csv'):
@@ -544,7 +548,7 @@ def local_dataset(dataset_name):
     else:
         raise ValueError(f"Unsupported dataset format: {dataset_name}")
 
-    split_dataset = full_dataset.train_test_split(test_size=0.1)
+    split_dataset = full_dataset.train_test_split(test_size=test_size, shuffle=False)
     return split_dataset
 
 def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
@@ -592,7 +596,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             if os.path.exists(dataset_name):
                 try:
                     args.dataset_format = args.dataset_format if args.dataset_format else "input-output"
-                    full_dataset = local_dataset(dataset_name)
+                    full_dataset = local_dataset(dataset_name, args.eval_dataset_size)
                     return full_dataset
                 except:
                     raise ValueError(f"Error loading dataset from {dataset_name}")
@@ -640,6 +644,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     if args.do_eval or args.do_predict:
         if 'eval' in dataset:
             eval_dataset = dataset['eval']
+        elif 'test' in dataset:
+            eval_dataset = dataset['test']
         else:
             print('Splitting train dataset in train and validation according to `eval_dataset_size`')
             dataset = dataset["train"].train_test_split(
@@ -685,6 +691,65 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
+class SavingEarlyStoppingCallback(transformers.EarlyStoppingCallback):
+    def __init__(self, early_stopping_patience: int = 1, early_stopping_threshold: Optional[float] = 0.0):
+        super().__init__(early_stopping_patience, early_stopping_threshold)
+        self.best_metric = None
+        self.metric_value = None
+
+    def check_metric_value(self, args, state, control, metric_value):
+        if self.is_current_metric_best(args):
+            self.early_stopping_patience_counter = 0
+        else:
+            self.early_stopping_patience_counter += 1
+
+    def save_best(self, args, state, kwargs):
+        best_regex = os.path.join(args.output_dir, f"best-*")
+        for model_dir in glob.glob(best_regex):
+            shutil.rmtree(model_dir)
+
+        print('Saving best PEFT checkpoint...')
+        checkpoint_folder = os.path.join(args.output_dir, f"best-{state.global_step}")
+
+        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+        kwargs["model"].save_pretrained(peft_model_path)
+        print('Saved best PEFT checkpoint...')
+
+        # pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        # if os.path.exists(pytorch_model_path):
+        #     os.remove(pytorch_model_path)
+    
+    def is_current_metric_best(self, args):
+        operator = np.greater if args.greater_is_better else np.less
+        if self.best_metric is None:
+            return True
+        else:
+            return operator(self.metric_value, self.best_metric) and (abs(self.metric_value - self.best_metric) > self.early_stopping_threshold)
+
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        metric_to_check = args.metric_for_best_model
+        if not metric_to_check.startswith("eval_"):
+            metric_to_check = f"eval_{metric_to_check}"
+        self.metric_value = metrics.get(metric_to_check)
+
+        if self.metric_value is None:
+            logger.warning(
+                f"early stopping required metric_for_best_model, but did not find {metric_to_check} so early stopping"
+                " is disabled"
+            )
+            return
+        
+        self.check_metric_value(args, state, control, self.metric_value)
+
+        if self.is_current_metric_best(args):
+            self.save_best(args, state, kwargs)
+
+        self.best_metric = self.metric_value if self.is_current_metric_best(args) else self.best_metric
+
+        if self.early_stopping_patience_counter >= self.early_stopping_patience:
+            control.should_training_stop = True
+
+
 def train():
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
@@ -716,9 +781,12 @@ def train():
         **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
     )
 
+
     # Callbacks
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
+    if training_args.stopping_patience > 0:
+        trainer.add_callback(SavingEarlyStoppingCallback(training_args.stopping_patience, 0.0))
     if args.do_mmlu_eval:
         if args.mmlu_dataset == 'mmlu-zs':
             mmlu_dataset = load_dataset("json", data_files={
